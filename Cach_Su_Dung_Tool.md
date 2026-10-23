@@ -144,7 +144,7 @@ python3 "$ANALYZER" diff "$DATASET_DIR/$PACKAGE" --report "$OUTPUT_DIR/${PACKAGE
 python3 "$ANALYZER" diff "$DATASET_DIR/$PACKAGE" --out-dir "$OUTPUT_DIR/copies"
 ```
 
-## Lưu báo cáo quét tĩnh bên ngoài dataset
+## Lưu báo cáo quét tĩnh, bên ngoài dataset
 
 ```bash
 python3 "$ANALYZER" scan "$DATASET_DIR/$PACKAGE" --report "$OUTPUT_DIR/${PACKAGE}_scan.md"
