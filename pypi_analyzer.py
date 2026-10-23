@@ -13,10 +13,13 @@ import contextlib
 import hashlib
 import ast
 import difflib
+import errno
+import tokenize
 import json
 import os
 import re
 import shutil
+import shlex
 import sys
 import tarfile
 import tempfile
@@ -27,6 +30,15 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 VERSION_CHANGES_FILENAME = "version_changes.md"
+PACKAGE_CONCLUSION_FILENAME = "package_conclusion.md"
+GENERATED_REPORT_NAMES = {VERSION_CHANGES_FILENAME, PACKAGE_CONCLUSION_FILENAME}
+VERDICT_BENIGN = "Lành"
+VERDICT_MALICIOUS = "Độc"
+VERDICT_UNKNOWN = "Chưa kết luận do chưa đủ bằng chứng"
+CLASSIFIER_VERSION = "static-evidence-v1"
+MAX_STATIC_SOURCE_BYTES = 8 * 1024 * 1024
+MAX_STATIC_AST_NODES = 150000
+RESOURCE_ERRNOS = {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}
 
 # Ensure stdout handles UTF-8 on Windows
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
@@ -181,7 +193,7 @@ def find_all_package_versions(pkg_name: str, search_roots: List[Path]) -> List[T
         if source_zip.is_file():
             add(version, source_zip)
         if not archives and not source_zip.is_file():
-            if any(p.is_file() and p.name != VERSION_CHANGES_FILENAME for p in directory.rglob("*")):
+            if any(p.is_file() and p.name not in GENERATED_REPORT_NAMES for p in directory.rglob("*")):
                 add(version, directory)
 
     def inspect_package(directory):
@@ -223,15 +235,13 @@ def find_all_package_versions(pkg_name: str, search_roots: List[Path]) -> List[T
     for version, paths in candidates.items():
         paths.sort(key=lambda p: (priority(p), str(p.resolve())))
         selected = paths[0]
-        if len(paths) > 1:
-            print("[!] {}=={}: {} candidate sources; selected {}".format(
-                pkg_name, version, len(paths), selected), file=sys.stderr)
         matched.append((version, selected))
 
-    def version_key(item):
-        return tuple((0, int(part)) if part.isdigit() else (1, part.lower())
-                     for part in re.split(r"(\d+)", str(item[0])))
-    matched.sort(key=version_key)
+    duplicate_count = sum(len(paths) > 1 for paths in candidates.values())
+    if duplicate_count:
+        print("[!] {}: {} versions have multiple sources; one source per version was selected (paths in reports).".format(
+            pkg_name, duplicate_count), file=sys.stderr)
+    matched.sort(key=lambda item: release_version_key(item[0]))
     return matched
 
 
@@ -261,18 +271,23 @@ def extract_package(archive_or_dir: Path, dest_dir: Path) -> Path:
     temp_extract.mkdir(parents=True, exist_ok=True)
 
     if archive_or_dir.is_dir():
+        for entry in archive_or_dir.rglob("*"):
+            if entry.is_symlink():
+                raise ValueError("Source symlink is unsupported: " + str(entry))
         for item in archive_or_dir.iterdir():
-            if item.name == VERSION_CHANGES_FILENAME:
+            if item.name in GENERATED_REPORT_NAMES:
                 continue
             target = temp_extract / item.name
             if item.is_dir():
-                shutil.copytree(item, target, ignore=shutil.ignore_patterns(VERSION_CHANGES_FILENAME))
+                shutil.copytree(item, target, ignore=shutil.ignore_patterns(*GENERATED_REPORT_NAMES))
             else:
                 shutil.copy2(item, target)
 
     elif archive_or_dir.suffix in [".tgz"] or archive_or_dir.name.endswith(".tar.gz"):
         with tarfile.open(archive_or_dir, "r:*") as tar:
             for member in tar.getmembers():
+                if not (member.isfile() or member.isdir()):
+                    raise ValueError("Archive link/special file is unsupported: " + member.name)
                 dest = (temp_extract / member.name).resolve()
                 if not is_safe_path(temp_extract, dest):
                     raise ValueError(f"Path traversal detected in archive: {member.name}")
@@ -283,6 +298,8 @@ def extract_package(archive_or_dir: Path, dest_dir: Path) -> Path:
             safe_members = []
             for member in z.infolist():
                 name = member.filename
+                if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise ValueError("Zip symlink is unsupported: " + name)
                 if name.startswith("__MACOSX/") or name.startswith("__MACOSX\\") or "/__MACOSX/" in name:
                     continue
                 if name.startswith("._") or "/._" in name or "\\._" in name:
@@ -298,6 +315,10 @@ def extract_package(archive_or_dir: Path, dest_dir: Path) -> Path:
 
     else:
         raise ValueError(f"Unsupported package format: {archive_or_dir}")
+
+    for report in temp_extract.rglob("*"):
+        if report.is_file() and report.name in GENERATED_REPORT_NAMES:
+            report.unlink()
 
     # Normalize root: if there's only 1 top-level subdirectory, flatten it
     top_items = [p for p in temp_extract.iterdir() if p.name != "__MACOSX"]
@@ -362,12 +383,15 @@ def fetch_pypi_package(package_name: str, version: Optional[str], dest_dir: Path
 # ==========================================
 # AST & Static Code Scanner
 # ==========================================
-def scan_python_code(file_path: Path, rel_path: str) -> List[Finding]:
+def scan_python_code(file_path: Path, rel_path: str, content: Optional[str] = None) -> List[Finding]:
     findings = []
-    try:
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception as e:
-        return findings
+    if content is None:
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError as error:
+            if error.errno in RESOURCE_ERRNOS:
+                raise
+            return findings
 
     lines = content.splitlines()
 
@@ -443,15 +467,305 @@ def scan_package_dir(root_dir: Path) -> List[Finding]:
 # Diffing & Evolution Analysis
 # ==========================================
 def history_file_map(root: Path) -> Dict[str, Path]:
-    """Ignore only the generated report, so a rerun never diffs its own output."""
+    """Ignore the two generated reports; preserve all other source paths."""
     result = {}
     for path in root.rglob("*"):
-        if not path.is_file() or path.name == VERSION_CHANGES_FILENAME:
+        if not path.is_file() or path.name in GENERATED_REPORT_NAMES:
             continue
         if not is_safe_path(root, path):
             raise ValueError("Source file points outside the extracted package: " + str(path))
         result[path.relative_to(root).as_posix()] = path
     return result
+
+
+class StaticEvidenceAnalyzer(ast.NodeVisitor):
+    """Small, local AST data-flow rules. Never evaluates or decodes a payload."""
+    NETWORK = {"requests.get", "requests.post", "requests.put", "requests.request",
+               "urllib.request.urlopen", "urllib2.urlopen", "httpx.get", "httpx.post"}
+    SEND = {"requests.get", "requests.post", "requests.put", "requests.request",
+            "urllib.request.urlopen", "urllib2.urlopen", "httpx.get", "httpx.post"}
+    EXECUTE = {"exec", "eval", "builtins.exec", "builtins.eval"}
+    PROCESS = {"os.system", "os.popen", "subprocess.Popen", "subprocess.run",
+               "subprocess.call", "subprocess.check_output", "pty.spawn"}
+    DECODE = {"base64.b64decode", "base64.b32decode", "base64.b16decode",
+              "base64.standard_b64decode", "zlib.decompress", "marshal.loads", "codecs.decode"}
+
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.aliases, self.values, self.literals, self.handles = {}, {}, {}, {}
+        self.downloads, self.redirects = set(), set()
+        self.evidence, self.weak_signals = [], []
+
+    def name(self, node):
+        if isinstance(node, ast.Name):
+            return self.aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            return self.name(node.value) + "." + node.attr
+        return ""
+
+    def literal(self, node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value[:8192]
+        if isinstance(node, ast.Name):
+            return self.literals.get(node.id, "")
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return (self.literal(node.left) + self.literal(node.right))[:8192]
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return " ".join(self.literal(n) for n in node.elts)[:8192]
+        return ""
+
+    def tags(self, node, depth=0):
+        if node is None or depth > 32:
+            return set()
+        if isinstance(node, ast.Name):
+            result = set(self.values.get(node.id, ()))
+            if self.name(node) == "os.environ":
+                result.add("sensitive")
+            return result
+        if isinstance(node, ast.Subscript) and self.name(node.value) == "os.environ":
+            key = self.literal(node.slice)
+            return {"sensitive"} if re.search(r"secret|password|token|credential|access.?key", key, re.I) else set()
+        if isinstance(node, ast.Call):
+            name = self.name(node.func)
+            if name in {"os.getenv", "os.environ.get"}:
+                key = self.literal(node.args[0]) if node.args else ""
+                return {"sensitive"} if re.search(r"secret|password|token|credential|access.?key", key, re.I) else set()
+            result = set()
+            for arg in list(node.args) + [k.value for k in node.keywords]:
+                result.update(self.tags(arg, depth + 1))
+            if isinstance(node.func, ast.Attribute):
+                result.update(self.tags(node.func.value, depth + 1))
+            if name in self.NETWORK:
+                result.add("remote")
+            if name in self.DECODE:
+                result.add("encoded")
+            if name in {"socket.socket", "socket.create_connection"}:
+                result.add("socket")
+            if name in {"open", "io.open", "pathlib.Path.read_text", "pathlib.Path.read_bytes"}:
+                if any(re.search(r"(?:\.ssh|\.aws|\.env(?:\b|/)|/etc/shadow|/etc/passwd|credentials)", self.literal(arg), re.I)
+                       for arg in node.args):
+                    result.add("sensitive")
+            return result
+        if isinstance(node, ast.Attribute) and self.name(node) == "os.environ":
+            return {"sensitive"}
+        result = set()
+        for child in ast.iter_child_nodes(node):
+            result.update(self.tags(child, depth + 1))
+        return result
+
+    def add(self, node, rule, description):
+        key = (rule, getattr(node, "lineno", 0))
+        if len(self.evidence) < 20 and not any((e["rule"], e["line"]) == key for e in self.evidence):
+            self.evidence.append({"file": self.filename, "line": key[1], "rule": rule, "description": description})
+
+    def mark_download(self, node):
+        text = self.literal(node)
+        if text:
+            self.downloads.add(text)
+        if isinstance(node, ast.Name):
+            self.values.setdefault(node.id, set()).add("downloaded")
+
+    def visit_Import(self, node):
+        for item in node.names:
+            self.aliases[item.asname or item.name.split(".")[0]] = item.name if item.asname else item.name.split(".")[0]
+
+    def visit_ImportFrom(self, node):
+        for item in node.names:
+            if item.name != "*":
+                self.aliases[item.asname or item.name] = (node.module + "." if node.module else "") + item.name
+
+    def visit_Assign(self, node):
+        self.visit(node.value)
+        tags, text, alias = self.tags(node.value), self.literal(node.value), self.name(node.value)
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self.values[target.id] = set(tags)
+                self.literals[target.id] = text
+                self.aliases[target.id] = "__local__"
+                if alias:
+                    self.aliases[target.id] = alias
+                if isinstance(node.value, ast.Call) and self.name(node.value.func) in {"open", "io.open"} and node.value.args:
+                    self.handles[target.id] = node.value.args[0]
+
+    def visit_AnnAssign(self, node):
+        if node.value is not None:
+            self.visit_Assign(ast.Assign(targets=[node.target], value=node.value))
+
+    def visit_AugAssign(self, node):
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            self.values.setdefault(node.target.id, set()).update(self.tags(node.value))
+
+    def visit_With(self, node):
+        for item in node.items:
+            self.visit(item.context_expr)
+            if (isinstance(item.optional_vars, ast.Name) and isinstance(item.context_expr, ast.Call)
+                    and self.name(item.context_expr.func) in {"open", "io.open"} and item.context_expr.args):
+                self.handles[item.optional_vars.id] = item.context_expr.args[0]
+                self.values[item.optional_vars.id] = self.tags(item.context_expr)
+        for item in node.body:
+            self.visit(item)
+
+    visit_AsyncWith = visit_With
+
+    def visit_FunctionDef(self, node):
+        for expression in node.decorator_list + node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+            self.visit(expression)
+        saved = (self.aliases, self.values, self.literals, self.handles, self.downloads, self.redirects)
+        self.aliases = dict(self.aliases)
+        self.values = {k: set(v) for k, v in self.values.items()}
+        self.literals, self.handles = dict(self.literals), dict(self.handles)
+        self.downloads, self.redirects = set(self.downloads), set()
+        args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+        args += [a for a in (node.args.vararg, node.args.kwarg) if a]
+        for arg in args:
+            self.aliases[arg.arg] = "__local__"
+            self.values.pop(arg.arg, None)
+            self.literals.pop(arg.arg, None)
+        try:
+            for item in node.body:
+                self.visit(item)
+        finally:
+            self.aliases, self.values, self.literals, self.handles, self.downloads, self.redirects = saved
+        self.aliases[node.name] = "__local__"
+        self.values.pop(node.name, None)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        for expression in node.bases + node.decorator_list + [keyword.value for keyword in node.keywords]:
+            self.visit(expression)
+        saved = (self.aliases, self.values, self.literals, self.handles, self.downloads, self.redirects)
+        self.aliases = dict(self.aliases)
+        self.values = {key: set(value) for key, value in self.values.items()}
+        self.literals, self.handles = dict(self.literals), dict(self.handles)
+        self.downloads, self.redirects = set(self.downloads), set(self.redirects)
+        try:
+            for item in node.body:
+                self.visit(item)
+        finally:
+            self.aliases, self.values, self.literals, self.handles, self.downloads, self.redirects = saved
+        self.aliases[node.name] = "__local__"
+
+    def visit_Call(self, node):
+        # Child calls must be visited first (e.g. a nested download).
+        self.generic_visit(node)
+        name = self.name(node.func)
+        arguments = list(node.args) + [k.value for k in node.keywords]
+        tags = set().union(*(self.tags(arg) for arg in arguments)) if arguments else set()
+        if (name in self.NETWORK | self.EXECUTE | self.PROCESS | self.DECODE or name in {"urllib.request.urlretrieve", "pickle.loads", "pickle.load"}) and len(self.weak_signals) < 4:
+            self.weak_signals.append("{}:{} ({})".format(self.filename, node.lineno, name))
+        if name in self.EXECUTE and tags.intersection({"remote", "encoded"}):
+            self.add(node, "ENCODED_OR_REMOTE_EXECUTION", "Thực thi động dữ liệu lấy từ mạng hoặc qua hàm giải mã.")
+        if name in {"pickle.loads", "pickle.load"} and tags.intersection({"remote", "encoded"}):
+            self.add(node, "UNTRUSTED_DESERIALIZATION", "Nạp pickle có dữ liệu từ mạng hoặc qua giải mã.")
+        if name in self.SEND and "sensitive" in tags:
+            self.add(node, "SENSITIVE_DATA_TO_NETWORK", "Truyền dữ liệu nhạy cảm vào lời gọi mạng trong cùng luồng AST.")
+        if name == "urllib.request.urlretrieve" and len(node.args) > 1:
+            self.mark_download(node.args[1])
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "write" and "remote" in tags:
+            receiver = node.func.value
+            path = self.handles.get(receiver.id) if isinstance(receiver, ast.Name) else None
+            if isinstance(receiver, ast.Call) and self.name(receiver.func) in {"open", "io.open"} and receiver.args:
+                path = receiver.args[0]
+            if path is not None:
+                self.mark_download(path)
+        if name == "os.dup2" and len(node.args) > 1 and "socket" in self.tags(node.args[0]):
+            fd = node.args[1]
+            if isinstance(fd, ast.Constant) and fd.value in (0, 1, 2):
+                self.redirects.add(fd.value)
+        if name in self.PROCESS:
+            text = " ".join(self.literal(arg) for arg in arguments)
+            first = node.args[0] if node.args else None
+            command = list(first.elts) if isinstance(first, (ast.List, ast.Tuple)) else []
+            executable = self.literal(command[0]) if command else ""
+            if not command and first is not None:
+                try:
+                    tokens = shlex.split(self.literal(first))
+                except ValueError:
+                    tokens = []
+                executable = tokens[0] if tokens else ""
+                operands = tokens[1:]
+            else:
+                operands = [self.literal(arg) for arg in command[1:]]
+            interpreter = re.fullmatch(r"(?:python[0-9.]*|sh|bash|zsh|perl|ruby|node|powershell(?:\.exe)?)", executable.replace("\\", "/").rsplit("/", 1)[-1])
+            downloaded_executable = executable in self.downloads or (command and "downloaded" in self.tags(command[0]))
+            downloaded_script = interpreter and (any(operand in self.downloads for operand in operands) or
+                                 any("downloaded" in self.tags(arg) for arg in command[1:]))
+            if downloaded_executable or downloaded_script:
+                self.add(node, "DOWNLOAD_THEN_EXECUTE", "Tệp vừa tải từ mạng được dùng làm chương trình hoặc script cho trình thực thi.")
+            shell_names = {"sh", "bash", "zsh", "cmd.exe", "powershell"}
+            executable_name = executable.replace("\\", "/").rsplit("/", 1)[-1]
+            shell_evaluation = (name in {"os.system", "os.popen"} or
+                                any(k.arg == "shell" and isinstance(k.value, ast.Constant) and k.value.value is True for k in node.keywords) or
+                                (executable_name in shell_names and any(flag in operands for flag in ("-c", "/c", "-Command"))))
+            if shell_evaluation and re.search(r"\b(?:curl|wget)\b[^\n|]*https?://[^\n|]*\|\s*(?:/bin/)?(?:sh|bash|python\d*)\b", text):
+                self.add(node, "DOWNLOAD_PIPE_EXECUTE", "Lệnh shell chuyển nội dung tải từ mạng trực tiếp sang trình thực thi.")
+            shell = re.search(r"(?:^|[\s/])(?:bash|sh|zsh|cmd\.exe|powershell)(?:\s|$)", text)
+            if shell and (executable_name in shell_names or shell_evaluation) and (len(self.redirects) >= 2 or "/dev/tcp/" in text):
+                self.add(node, "REVERSE_SHELL_PATTERN", "Mẫu kết hợp shell và chuyển hướng kết nối/luồng socket.")
+
+
+def unknown_assessment(reason: str) -> Dict:
+    return {"label": VERDICT_UNKNOWN, "reason": reason, "method": CLASSIFIER_VERSION,
+            "files_examined": 0, "python_files": 0, "coverage_issues": [],
+            "weak_findings": 0, "evidence": []}
+
+
+def classify_source(root: Path) -> Dict:
+    """Three operational labels, scoped to the selected source and these static rules."""
+    result = unknown_assessment("Chưa đọc được mã nguồn Python.")
+    weak_samples = []
+    opaque_extensions = {".so", ".pyd", ".dll", ".dylib", ".exe", ".pyc", ".pyo", ".sh",
+                         ".bash", ".ps1", ".bat", ".cmd", ".js", ".wasm", ".jar", ".zip", ".whl", ".tgz", ".gz"}
+    for relative, path in sorted(history_file_map(root).items()):
+        suffix = path.suffix.lower()
+        if suffix in opaque_extensions:
+            result["coverage_issues"].append(relative + ": mã thực thi/nguồn đóng gói chưa phân tích được.")
+        if suffix not in {".py", ".pyw", ".pth"}:
+            continue
+        result["files_examined"] += 1
+        try:
+            if path.stat().st_size > MAX_STATIC_SOURCE_BYTES:
+                raise ValueError("vượt giới hạn phân tích AST {} MiB".format(MAX_STATIC_SOURCE_BYTES // 1024 // 1024))
+            with tokenize.open(str(path)) as stream:
+                content = stream.read()
+            if suffix == ".pth":
+                content = "\n".join(line for line in content.splitlines() if line.lstrip().startswith(("import ", "import\t")))
+            if not content.strip():
+                continue
+            tree = ast.parse(content, filename=relative)
+            if sum(1 for _ in ast.walk(tree)) > MAX_STATIC_AST_NODES:
+                raise ValueError("vượt giới hạn số nút AST")
+            result["python_files"] += 1
+            analyzer = StaticEvidenceAnalyzer(relative)
+            analyzer.visit(tree)
+            result["evidence"].extend(analyzer.evidence[:max(0, 40 - len(result["evidence"]))])
+            matches = scan_python_code(path, relative, content)
+            result["weak_findings"] += len(matches) + len(analyzer.weak_signals)
+            weak_samples.extend(analyzer.weak_signals[:max(0, 2 - len(weak_samples))])
+            weak_samples.extend("{}:{} ({})".format(relative, f.line_no, f.category) for f in matches[:max(0, 2 - len(weak_samples))])
+        except (UnicodeError, LookupError, SyntaxError, ValueError, RecursionError, OSError) as error:
+            if isinstance(error, OSError) and error.errno in RESOURCE_ERRNOS:
+                raise
+            result["coverage_issues"].append(relative + ": " + str(error).splitlines()[0])
+    result["evidence"] = result["evidence"][:40]
+    if result["evidence"]:
+        first = result["evidence"][0]
+        result["label"] = VERDICT_MALICIOUS
+        result["reason"] = "{}:{} — {}".format(first["file"], first["line"], first["description"])
+    elif result["coverage_issues"]:
+        result["reason"] = result["coverage_issues"][0]
+    elif not result["python_files"]:
+        result["reason"] = "Không có mã Python không rỗng để phân tích đầy đủ."
+    elif result["weak_findings"]:
+        result["reason"] = "Có {} dấu hiệu theo quy tắc nhưng chưa xác lập được chuỗi hành vi đủ mạnh: {}.".format(
+            result["weak_findings"], "; ".join(weak_samples[:2]))
+    else:
+        result["label"] = VERDICT_BENIGN
+        result["reason"] = "Đã đọc và phân tích được {} tệp mã Python; không khớp dấu hiệu trong bộ quy tắc hiện tại.".format(result["python_files"])
+    return result
+
 
 
 def python_change_description(old_text: str, new_text: str) -> str:
@@ -748,6 +1062,26 @@ def code_block(content: str, language: str = "diff") -> str:
     return fence + language + "\n" + content + ("" if content.endswith("\n") else "\n") + fence + "\n"
 
 
+def release_version_key(version: str):
+    """Order common PEP 440 spellings; deterministic natural fallback for other names."""
+    match = re.fullmatch(
+        r"v?(?:(\d+)!)?(\d+(?:\.\d+)*)(?:[-_.]?(a|b|rc|alpha|beta|c|pre|preview)[-_.]?(\d*))?"
+        r"(?:(?:-(\d+))|(?:[-_.]?(post|rev|r)[-_.]?(\d*)))?"
+        r"(?:[-_.]?dev[-_.]?(\d*))?(?:\+([a-z0-9]+(?:[-_.][a-z0-9]+)*))?", str(version), re.I)
+    if not match:
+        return (1, tuple((0, int(t)) if t.isdigit() else (1, t.lower()) for t in re.split(r"(\d+)", str(version))))
+    epoch, release, pre, pre_n, post_dash, post_tag, post_n, dev_n, local = match.groups()
+    parts = [int(t) for t in release.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    has_post = post_dash is not None or post_tag is not None
+    pre_key = (({"a": 0, "alpha": 0, "b": 1, "beta": 1}.get(pre.lower(), 2), int(pre_n or 0)) if pre
+               else ((-1, 0) if dev_n is not None and not has_post else (3, 0)))
+    local_key = tuple((1, int(t)) if t.isdigit() else (0, t.lower()) for t in re.split(r"[-_.]", local)) if local else ()
+    return (0, int(epoch or 0), tuple(parts), pre_key, int(post_dash or post_n or 0) if has_post else -1,
+            int(dev_n or 0) if dev_n is not None else float("inf"), local_key)
+
+
 def render_version_history(package: str, info: Dict, previous: Optional[Dict], diff: Optional[Dict]) -> str:
     md = ["# {} — {}".format(markdown_code(package), markdown_code(info["version"])), ""]
     md += ["- **Version hiện tại:** " + markdown_code(info["version"]),
@@ -755,11 +1089,18 @@ def render_version_history(package: str, info: Dict, previous: Optional[Dict], d
            "- **Nguồn hiện tại:** " + markdown_code(info["path"])]
     if previous:
         md.append("- **Nguồn đối chiếu:** " + markdown_code(previous["path"]))
-    md += ["", "## 1. Mô tả thay đổi", ""]
-    if previous is None:
+    assessment = info.get("assessment") or unknown_assessment("Chưa thực hiện phân loại mã nguồn.")
+    md += ["- **Phương pháp kết luận:** " + markdown_code(assessment["method"]) + "; phân tích toàn bộ nguồn được chọn, không chỉ phần diff.",
+           "", "## 1. Mô tả thay đổi", ""]
+    problem = info.get("error") or info.get("diff_error")
+    if problem:
+        md.append("**Không hoàn tất:** " + markdown_text(problem))
+    elif previous is None:
         md += ["Đây là bản đầu tiên có trong dữ liệu được chọn. Chưa có bản trước để xác định thay đổi.",
                "Không suy ra đây là lần phát hành đầu tiên hoặc phiên bản lành tính.", "",
                "Số tệp trong nguồn đã đọc: **{}**.".format(info["file_count"])]
+    elif diff is None:
+        md.append("Chưa tạo được diff với version liền trước; không thay bằng một version xa hơn.")
     else:
         changes = diff["file_changes"]
         md += ["So sánh **{} → {}**.".format(markdown_text(previous["version"]), markdown_text(info["version"])), "",
@@ -775,7 +1116,9 @@ def render_version_history(package: str, info: Dict, previous: Optional[Dict], d
             md.append("Không phát hiện thay đổi về đường dẫn hoặc nội dung tệp giữa hai nguồn đã đọc.")
         md += ["", "Mô tả được tạo từ thay đổi của tệp và cấu trúc Python đọc được; không suy diễn mục đích của tác giả."]
     md += ["", "## 2. Diff đối chiếu", ""]
-    if previous is None:
+    if problem or (previous is not None and diff is None):
+        md.append("Diff chưa có hoặc chưa hoàn tất. Không suy ra hai nguồn giống nhau.")
+    elif previous is None:
         md.append("Chưa có version trước để tạo diff.")
     elif not diff["file_changes"]:
         md.append("Không có diff nội dung.")
@@ -783,7 +1126,191 @@ def render_version_history(package: str, info: Dict, previous: Optional[Dict], d
         for item in diff["file_changes"]:
             md += ["### " + markdown_code(item["path"]), "",
                    code_block(item["patch_text"], "text" if item["binary"] else "diff")]
+    reason = assessment["reason"]
+    if assessment["label"] == VERDICT_MALICIOUS and assessment["coverage_issues"]:
+        reason += " Còn {} giới hạn đọc/phân tích khác; xem phạm vi trong JSON khi cần.".format(len(assessment["coverage_issues"]))
+    md += ["", "**Kết luận: {}** — {}".format(assessment["label"], markdown_text(reason))]
     return "\n".join(md).rstrip() + "\n"
+
+
+def package_conclusion_path(package: str, version: str, source: Path, report: Path) -> Path:
+    directory = report.parent
+    normalized = lambda s: re.sub(r"[-_.]+", "-", s).lower()
+    match = re.fullmatch(r"(.+?)-([vV]?\d.*)", directory.name)
+    if directory.name == history_component(version):
+        base = directory.parent
+    elif match and normalized(match.group(1)) == normalized(package):
+        base = directory.parent / history_component(package)
+    elif source.is_dir():
+        base = directory
+    else:
+        base = directory.parent
+    return base / PACKAGE_CONCLUSION_FILENAME
+
+
+def render_package_conclusion(package: str, rows: List[Dict], selected_pair: bool, run_errors: Optional[List[str]] = None) -> str:
+    counts = Counter(row["label"] for row in rows)
+    pending = sum(row["status"] == "pending" for row in rows)
+    errors = sum(row["status"] == "error" for row in rows)
+    md = ["# Kết luận tổng — " + markdown_code(package), "",
+          "**Phạm vi:** " + ("Chỉ hai nguồn được chọn để đối chiếu; không đại diện cho toàn bộ chuỗi version." if selected_pair else
+                               "Các version local tìm được trong lần chạy này; không suy ra các bản vắng mặt."), "",
+          "**Tiến độ:** {}/{} version đã xử lý; {} version có lỗi; {} version chưa xử lý.".format(len(rows) - pending, len(rows), errors, pending), "",
+          "**Thống kê:** Lành: **{}** · Độc: **{}** · Chưa kết luận do chưa đủ bằng chứng: **{}**.".format(
+              counts[VERDICT_BENIGN], counts[VERDICT_MALICIOUS], counts[VERDICT_UNKNOWN]), "",
+          "| Version | Kết luận | Xử lý | Căn cứ / giới hạn |", "|---|---|---|---|"]
+    for row in rows:
+        status = {"pending": "Chưa xử lý", "completed": "Hoàn tất", "error": "Có lỗi"}[row["status"]]
+        md.append("| {} | {} | {} | {} |".format(markdown_code(row["version"]), row["label"], status,
+                  markdown_text(row.get("error") or row["reason"])))
+    md += ["", "## Diễn biến trong dữ liệu được chọn", ""]
+    if selected_pair:
+        md.append("Chế độ chọn cặp không xác định số version trung gian hoặc độ dài chuỗi Lành/Độc.")
+    else:
+        runs = []
+        for row in rows:
+            label = row["label"]
+            if row["status"] != "completed" or label == VERDICT_UNKNOWN:
+                runs.append({"label": VERDICT_UNKNOWN, "versions": [row["version"]]})
+            elif runs and runs[-1]["label"] == label:
+                runs[-1]["versions"].append(row["version"])
+            else:
+                runs.append({"label": label, "versions": [row["version"]]})
+        for run in runs:
+            versions = run["versions"]
+            if run["label"] == VERDICT_UNKNOWN:
+                md.append("- {}: chưa đủ kết luận hoặc xử lý chưa hoàn tất; ngắt chuỗi suy luận.".format(markdown_code(versions[0])))
+            else:
+                span = markdown_code(versions[0]) if len(versions) == 1 else "{} → {}".format(markdown_code(versions[0]), markdown_code(versions[-1]))
+                md.append("- {}: **{}**, {} version liên tiếp có trong dữ liệu.".format(span, run["label"], len(versions)))
+        for before, after in zip(runs, runs[1:]):
+            if before["label"] != VERDICT_UNKNOWN and after["label"] != VERDICT_UNKNOWN and before["label"] != after["label"]:
+                md.append("- Chuyển **{} → {}** tại {}; trước đó có {} version {} liên tiếp trong dữ liệu.".format(
+                    before["label"], after["label"], markdown_code(after["versions"][0]), len(before["versions"]), before["label"]))
+    if run_errors:
+        md += ["", "## Lỗi lần chạy", "", "Lần chạy có lỗi; các báo cáo đã hoàn thành trước đó được giữ lại."]
+        for error in list(dict.fromkeys(run_errors))[:20]:
+            md.append("- " + markdown_text(error))
+        if len(run_errors) > 20:
+            md.append("- Còn {} thông báo lỗi khác đã in trong terminal.".format(len(run_errors) - 20))
+    md += ["", "## Cách hiểu kết luận tự động", "",
+           "- **Lành:** đã phân tích được mã Python của nguồn được chọn và không khớp quy tắc rủi ro hiện có; không phải chứng nhận an toàn.",
+           "- **Độc:** khớp quy tắc AST về chuỗi hành vi mạnh, như giải mã/tải rồi thực thi, dữ liệu nhạy cảm đưa vào mạng, hoặc mẫu reverse shell. Đây là nhãn tự động cần đọc cùng bằng chứng.",
+           "- **Chưa kết luận do chưa đủ bằng chứng:** chỉ có dấu hiệu đơn lẻ, mã không đọc/phân tích được, không có Python hữu ích, hoặc còn phần mã thực thi ngoài phạm vi.",
+           "", "Phương pháp: " + markdown_code(CLASSIFIER_VERSION) + ". Phân tích từng tệp, theo dõi liên hệ dữ liệu cục bộ trong AST; không chạy payload, không chứng minh đường chạy, không theo dõi đầy đủ qua hàm/module. Chỉ đánh giá một nguồn đại diện mỗi version.",
+           "Thứ tự dùng các dạng version phổ biến (dev, a, b, rc, final, post); tên khác dùng sắp xếp tự nhiên, không dùng upload time. Bản Độc đầu trong dữ liệu không mặc nhiên là Patient Zero."]
+    return "\n".join(md).rstrip() + "\n"
+
+
+def cleanup_history_temp(path: Path, workspace: Path):
+    """Delete only this run's managed version container; surface cleanup failures."""
+    if path.parent.resolve() != workspace.resolve() or not path.name.startswith("history_"):
+        raise ValueError("Refusing unmanaged temp cleanup: " + str(path))
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path)
+    except PermissionError:
+        path.chmod(0o700)
+        for entry in path.rglob("*"):
+            if not entry.is_symlink():
+                entry.chmod(0o700 if entry.is_dir() else 0o600)
+        shutil.rmtree(path)
+
+
+def describe_history_error(error: Exception, package: str, version: str, action: str, path: Path, workspace: Path) -> str:
+    message = "package={} version={} action={} path={} temp={}: {}: {}".format(package, version, action, path, workspace, type(error).__name__, error)
+    if isinstance(error, OSError) and error.errno in RESOURCE_ERRNOS:
+        message += ". Hết dung lượng/quota; các báo cáo đã lưu trước đó được giữ lại."
+        try:
+            disk = shutil.disk_usage(workspace)
+            message += " Temp free={} bytes.".format(disk.free)
+            if hasattr(os, "statvfs"):
+                message += " Temp free inodes={}.".format(os.statvfs(workspace).f_favail)
+        except OSError:
+            pass
+    return message
+
+
+class HistoryOutput:
+    """Stream terminal/JSON and optional aggregate; no full-chain diff buffer."""
+    def __init__(self, args, package, versions):
+        self.args, self.package, self.versions = args, package, versions
+        self.first, self.file, self.temporary = True, None, None
+
+    def __enter__(self):
+        if self.args.report:
+            target = Path(self.args.report)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self.file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=target.parent,
+                                                    prefix=".pypi_combined_", suffix=".tmp", delete=False)
+            self.temporary = Path(self.file.name)
+        if self.args.json:
+            sys.stdout.write('{"pkg_name":' + json.dumps(self.package, ensure_ascii=False) + ',"versions":' +
+                             json.dumps([v for v, _ in self.versions], ensure_ascii=False) + ',"reports":[')
+            sys.stdout.flush()
+        return self
+
+    def emit(self, record):
+        text = ("" if self.first else "\n---\n\n") + record["markdown"]
+        if self.file:
+            self.file.write(text)
+            self.file.flush()
+        if self.args.json:
+            sys.stdout.write(("" if self.first else ",") + json.dumps(record, ensure_ascii=False))
+        else:
+            sys.stdout.write(text)
+        self.first = False
+        sys.stdout.flush()
+
+    def finish(self, summary, summary_path, rows, errors):
+        text = ("" if self.first else "\n---\n\n") + summary
+        if self.file:
+            self.file.write(text)
+            self.file.flush()
+        if self.args.json:
+            sys.stdout.write('],"package_conclusion":' + json.dumps({"output": str(summary_path), "markdown": summary,
+                              "versions": rows}, ensure_ascii=False) + ',"errors":' + json.dumps(errors, ensure_ascii=False) +
+                             ',"complete":' + ("false" if errors or any(r["status"] == "pending" for r in rows) else "true") + '}\n')
+        else:
+            sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def __exit__(self, kind, error, traceback):
+        if self.file:
+            try:
+                self.file.close()
+                if kind is None:
+                    if Path(self.args.report).is_symlink():
+                        raise ValueError("Refusing report symlink: " + self.args.report)
+                    os.replace(str(self.temporary), self.args.report)
+                    print("[+] Saved: " + self.args.report, file=sys.stderr)
+            finally:
+                if self.temporary.exists():
+                    self.temporary.unlink()
+
+
+def validate_history_outputs(versions, outputs):
+    """Reject source/symlink/overlap destinations before changing any reports."""
+    source_files = {source.resolve() for _, source in versions if source.is_file()}
+    source_dirs = [source.resolve() for _, source in versions if source.is_dir()]
+    seen = {}
+    for path, identity in outputs:
+        path = path.absolute()
+        resolved = path.resolve()
+        if any(part.is_symlink() for part in [path] + list(path.parents)) or resolved in source_files:
+            raise ValueError("Report destination conflicts with a source or symlink: " + str(path))
+        if path.exists() and not path.is_file():
+            raise ValueError("Report destination is not a file: " + str(path))
+        if path.name not in GENERATED_REPORT_NAMES and any(is_safe_path(source, resolved) for source in source_dirs):
+            raise ValueError("Additional report would modify source directory: " + str(path))
+        if resolved in seen and seen[resolved] != identity:
+            raise ValueError("Report outputs overlap; choose a different --report or --out-dir: " + str(path))
+        seen[resolved] = identity
+    all_paths = set(seen)
+    for path in all_paths:
+        if any(parent in all_paths for parent in path.parents):
+            raise ValueError("Report file conflicts with another output directory: " + str(path))
 
 
 def infer_history_identity(path: Path) -> Tuple[str, str]:
@@ -907,50 +1434,151 @@ def execute_diff_history(args, parser, search_dirs: List[Path], cwd: Path, temp_
                 parser.error("Base and target versions must differ.")
             versions = [(version_a, mapping[version_a]), (version_b, mapping[version_b])]
 
-    infos = []
-    for index, (version, source) in enumerate(versions):
-        source = source.resolve()
-        unpacked = extract_package(source, temp_workspace / ("history_{:04d}".format(index)))
-        infos.append({"version": version, "path": source, "dir": unpacked,
-                      "file_count": len(history_file_map(unpacked))})
-
-    records = []
-    for index in range(1 if selected_pair else 0, len(infos)):
-        info = infos[index]
-        previous = infos[index - 1] if index else None
-        diff = compare_packages(previous["dir"], previous["version"], info["dir"], info["version"]) if previous else None
-        output = version_history_path(package, info["version"], info["path"], cwd, temp_workspace)
-        records.append({"version": info["version"], "previous_version": previous["version"] if previous else None,
-                        "source": str(info["path"]), "output": str(output), "diff": diff,
-                        "markdown": render_version_history(package, info, previous, diff)})
-
-    combined = "\n---\n\n".join(record["markdown"] for record in records)
-    writes = [(Path(record["output"]), record["markdown"]) for record in records]
+    versions = [(version, source.resolve()) for version, source in versions]
+    first_report = 1 if selected_pair else 0
+    report_paths = [version_history_path(package, version, source, cwd, temp_workspace) for version, source in versions]
+    summary_path = package_conclusion_path(package, versions[-1][0], versions[-1][1], report_paths[-1])
+    summary_copies = [summary_path]
+    destinations = [(report_paths[i], ("version", i)) for i in range(first_report, len(versions))]
+    copy_paths = {}
     if args.out_dir:
-        writes += [(Path(args.out_dir) / history_component(package) / history_component(record["version"]) /
-                    VERSION_CHANGES_FILENAME, record["markdown"]) for record in records]
+        for i in range(first_report, len(versions)):
+            copy_paths[i] = Path(args.out_dir) / history_component(package) / history_component(versions[i][0]) / VERSION_CHANGES_FILENAME
+            destinations.append((copy_paths[i], ("version", i)))
+        summary_copies.append(Path(args.out_dir) / history_component(package) / PACKAGE_CONCLUSION_FILENAME)
+    destinations += [(path, ("summary",)) for path in summary_copies]
     if args.report:
-        writes.append((Path(args.report), combined))
+        destinations.append((Path(args.report), ("combined",)))
+    validate_history_outputs(versions, destinations)
 
-    # Validate destinations before saving any reports.
-    pending = {}
-    source_files = {info["path"].resolve() for info in infos if info["path"].is_file()}
-    for path, content in writes:
-        resolved = path.resolve()
-        if path.is_symlink() or resolved in source_files:
-            raise ValueError("Report destination conflicts with a source or symlink: " + str(path))
-        if resolved in pending and pending[resolved] != content:
-            raise ValueError("Report outputs overlap; choose a different --report or --out-dir: " + str(path))
-        pending[resolved] = content
-    for path, content in pending.items():
-        write_history_file(path, content)
-        print("[+] Saved: " + str(path), file=sys.stderr)
-    if args.json:
-        print(json.dumps({"pkg_name": package, "versions": [i["version"] for i in infos], "reports": records},
-                         indent=2, ensure_ascii=False))
-    else:
-        print(combined, end="")
+    rows = [{"version": version, "source": str(source), "label": VERDICT_UNKNOWN,
+             "reason": "Chưa xử lý trong lần chạy này.", "status": "pending"} for version, source in versions]
+    errors, previous, interrupted = [], None, False
 
+    def save_summary():
+        summary = render_package_conclusion(package, rows, selected_pair, errors)
+        for destination in dict.fromkeys(summary_copies):
+            write_history_file(destination, summary)
+        return summary
+
+    print("[*] {}: {} versions; processing sequentially (at most two extracted versions). Temp: {}".format(
+        package, len(versions), temp_workspace), file=sys.stderr, flush=True)
+    action, action_path = "write initial package conclusion", summary_path
+    try:
+        save_summary()
+        with HistoryOutput(args, package, versions) as output:
+            try:
+                for index, (version, source) in enumerate(versions):
+                    print("[{}/{}] {}=={}: reading {}".format(index + 1, len(versions), package, version, source),
+                          file=sys.stderr, flush=True)
+                    container = temp_workspace / ("history_{:04d}".format(index))
+                    info = {"version": version, "path": source, "dir": None, "container": container, "file_count": 0}
+                    fatal, diff = False, None
+                    action, action_path = "extract/read source", source
+                    try:
+                        info["dir"] = extract_package(source, container)
+                        action, action_path = "map source files", info["dir"]
+                        info["file_count"] = len(history_file_map(info["dir"]))
+                        action = "classify full source"
+                        info["assessment"] = classify_source(info["dir"])
+                    except (OSError, ValueError, UnicodeError, zipfile.BadZipFile, tarfile.TarError, RuntimeError) as error:
+                        message = describe_history_error(error, package, version, action, action_path, temp_workspace)
+                        info["error"] = message
+                        info["assessment"] = unknown_assessment(message)
+                        info["dir"] = None
+                        errors.append(message)
+                        fatal = isinstance(error, OSError) and error.errno in RESOURCE_ERRNOS
+                        print("[ERROR] " + message, file=sys.stderr, flush=True)
+                    if index >= first_report and previous is not None and not info.get("error"):
+                        if previous["dir"] is None:
+                            info["diff_error"] = "Không đọc được version liền trước {}. Không so sánh bắc cầu qua version lỗi.".format(previous["version"])
+                        else:
+                            action, action_path = "compare {} -> {}".format(previous["version"], version), source
+                            try:
+                                diff = compare_packages(previous["dir"], previous["version"], info["dir"], version)
+                            except (OSError, ValueError, UnicodeError) as error:
+                                message = describe_history_error(error, package, version, action, action_path, temp_workspace)
+                                info["diff_error"] = message
+                                errors.append(message)
+                                fatal = isinstance(error, OSError) and error.errno in RESOURCE_ERRNOS
+                                print("[ERROR] " + message, file=sys.stderr, flush=True)
+                    row = rows[index]
+                    assessment = info["assessment"]
+                    row.update(label=assessment["label"], reason=assessment["reason"],
+                               status="error" if info.get("error") or info.get("diff_error") else "completed")
+                    if info.get("error") or info.get("diff_error"):
+                        row["error"] = info.get("error") or info["diff_error"]
+                    if index >= first_report:
+                        markdown = render_version_history(package, info, previous, diff)
+                        record = {"version": version, "previous_version": previous["version"] if previous else None,
+                                  "source": str(source), "output": str(report_paths[index]), "diff": diff,
+                                  "assessment": assessment, "status": row["status"], "markdown": markdown}
+                        try:
+                            for destination in dict.fromkeys([report_paths[index]] + ([copy_paths[index]] if index in copy_paths else [])):
+                                action, action_path = "write version report", destination
+                                write_history_file(destination, markdown)
+                                print("[+] Saved: " + str(destination), file=sys.stderr, flush=True)
+                            action, action_path = "stream version report", Path(args.report) if args.report else report_paths[index]
+                            output.emit(record)
+                        except (OSError, ValueError) as error:
+                            message = describe_history_error(error, package, version, action, action_path, temp_workspace)
+                            errors.append(message)
+                            row.update(status="error", error=message)
+                            fatal = True
+                            print("[ERROR] " + message, file=sys.stderr, flush=True)
+                        # Release all large, per-pair strings before the next extraction.
+                        del markdown, record
+                    del diff
+                    action, action_path = "update package conclusion", summary_path
+                    try:
+                        save_summary()
+                    except (OSError, ValueError) as error:
+                        message = describe_history_error(error, package, version, action, action_path, temp_workspace)
+                        errors.append(message)
+                        fatal = True
+                        print("[ERROR] " + message, file=sys.stderr, flush=True)
+                    if previous:
+                        action, action_path = "clean previous extracted version", previous["container"]
+                        try:
+                            cleanup_history_temp(previous["container"], temp_workspace)
+                        except (OSError, ValueError) as error:
+                            message = describe_history_error(error, package, version, action, action_path, temp_workspace)
+                            errors.append(message)
+                            fatal = True
+                            print("[ERROR] " + message, file=sys.stderr, flush=True)
+                    previous = info
+                    if fatal:
+                        break
+            except KeyboardInterrupt:
+                interrupted = True
+                errors.append("Đã ngắt bởi người dùng; các version chưa xử lý được ghi rõ trong kết luận tổng.")
+                print("\n[!] " + errors[-1], file=sys.stderr)
+            finally:
+                if previous:
+                    action, action_path = "clean last extracted version", previous["container"]
+                    try:
+                        cleanup_history_temp(previous["container"], temp_workspace)
+                    except (OSError, ValueError) as error:
+                        message = describe_history_error(error, package, previous["version"], action, action_path, temp_workspace)
+                        errors.append(message)
+                        print("[ERROR] " + message, file=sys.stderr, flush=True)
+            final_summary = render_package_conclusion(package, rows, selected_pair, errors)
+            action, action_path = "write final package conclusion", summary_path
+            try:
+                save_summary()
+                print("[+] Saved: " + str(summary_path), file=sys.stderr, flush=True)
+            except (OSError, ValueError) as error:
+                message = describe_history_error(error, package, versions[-1][0], action, action_path, temp_workspace)
+                errors.append(message)
+                print("[ERROR] " + message, file=sys.stderr, flush=True)
+            action, action_path = "finish terminal/combined output", Path(args.report) if args.report else summary_path
+            output.finish(final_summary, summary_path, rows, errors)
+    except (OSError, ValueError) as error:
+        raise ValueError(describe_history_error(error, package, versions[-1][0], action, action_path, temp_workspace)) from error
+    if interrupted:
+        raise SystemExit(130)
+    if errors or any(row["status"] != "completed" for row in rows):
+        raise SystemExit(1)
 
 
 def export_scan_report(output_file: Path, findings: List[Finding], sample_name: str, scanned_files: int):
@@ -1022,6 +1650,7 @@ Examples:
     diff_parser.add_argument("--pypi-version", help="Specific version to fetch from PyPI")
     diff_parser.add_argument("--report", help="Optional additional combined Markdown report")
     diff_parser.add_argument("--out-dir", help="Optional additional copies under DIR/package/version/version_changes.md")
+    diff_parser.add_argument("--temp-dir", help="Parent directory for temporary extraction (default: system temp)")
     diff_parser.add_argument("--json", action="store_true", help="Output as JSON")
     diff_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
 
@@ -1077,7 +1706,11 @@ Examples:
         parser.print_help()
         return
 
-    temp_workspace = Path(tempfile.mkdtemp(prefix="pypi_analysis_"))
+    try:
+        temp_workspace = Path(tempfile.mkdtemp(prefix="pypi_analysis_", dir=getattr(args, "temp_dir", None)))
+    except OSError as error:
+        print("Error creating analysis temp directory {}: {}".format(getattr(args, "temp_dir", None) or tempfile.gettempdir(), error), file=sys.stderr)
+        raise SystemExit(1)
     try:
         if args.command == "scan":
             sample_path = find_sample(args.sample, search_dirs)
